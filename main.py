@@ -234,3 +234,81 @@ async def process_pdf_upload(file: UploadFile = File(...)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+# =============== Moodle Proxy ===============
+from fastapi import FastAPI, HTTPException, UploadFile, File, Query
+from pydantic import BaseModel
+import requests, io
+
+class MoodCoursesReq(BaseModel):
+    base: str   # مثل https://lms.yu.edu.sa
+    token: str  # moodle_mobile_app token
+
+@app.post("/moodle/courses")
+def moodle_courses(req: MoodCoursesReq):
+    # core_enrol_get_users_courses (يتطلب user id عادةً؛ لكن مع توكن الموبايل نقدر نجيب أنا ذاتياً)
+    # نستخدم خدمة tool_mobile_call_external_functions عبر server.php
+    url = f"{req.base}/webservice/rest/server.php"
+    payload = {
+        "wstoken": req.token,
+        "moodlewsrestformat": "json",
+        "wsfunction": "core_enrol_get_users_courses",
+        "userid": 0  # 0 = المستخدم الحالي للتوكن في بعض تركيبات الموودل، وإن فشل نرجع رسالة
+    }
+    r = requests.post(url, data=payload, timeout=40)
+    if r.status_code != 200:
+        raise HTTPException(502, "Moodle courses fetch failed")
+    data = r.json()
+    if isinstance(data, dict) and data.get("exception"):
+        # محاولة بديلة: tool_mobile_get_course_contents مع استدعاء آخر يتطلب courseid لاحقاً
+        raise HTTPException(400, f"Moodle error: {data.get('message','unknown')}")
+    # نبسّط: id, shortname, fullname
+    out = [{"id": c.get("id"), "shortname": c.get("shortname"), "fullname": c.get("fullname")} for c in data]
+    return {"ok": True, "courses": out}
+
+class MoodContentsReq(BaseModel):
+    base: str
+    token: str
+    courseid: int
+
+@app.post("/moodle/contents")
+def moodle_course_contents(req: MoodContentsReq):
+    # core_course_get_contents لإحضار ملفات المقرر
+    url = f"{req.base}/webservice/rest/server.php"
+    payload = {
+        "wstoken": req.token,
+        "moodlewsrestformat": "json",
+        "wsfunction": "core_course_get_contents",
+        "courseid": req.courseid
+    }
+    r = requests.post(url, data=payload, timeout=40)
+    if r.status_code != 200:
+        raise HTTPException(502, "Moodle contents fetch failed")
+    data = r.json()
+    if isinstance(data, dict) and data.get("exception"):
+        raise HTTPException(400, f"Moodle error: {data.get('message','unknown')}")
+    # نستخرج الملفات القابلة للتنزيل (resource, fileurl)
+    files = []
+    for section in data:
+        for mod in section.get("modules", []):
+            for f in mod.get("contents", []) or []:
+                fileurl = f.get("fileurl")
+                if fileurl:
+                    files.append({
+                        "name": f.get("filename") or f.get("filepath") or mod.get("name"),
+                        "fileurl": fileurl,  # سنستخدمه عبر بروكسي التحميل أدناه
+                        "modname": mod.get("modname"),
+                        "section": section.get("name") or ""
+                    })
+    return {"ok": True, "files": files}
+
+@app.get("/moodle/fetch")
+def moodle_fetch(fileurl: str = Query(...), token: str = Query(...)):
+    # تنزيل الملف من Moodle باستخدام توكن (fileurl+token=...)
+    if "token=" not in fileurl:
+        sep = "&" if "?" in fileurl else "?"
+        fileurl = f"{fileurl}{sep}token={token}"
+    rr = requests.get(fileurl, timeout=60)
+    if rr.status_code != 200:
+        raise HTTPException(400, "Failed to fetch file from Moodle")
+    # نعيد البايتات كما هي (سيستقبلها الـiOS عبر endpoint آخر أو نستعملها داخليًا)
+    return rr.content
