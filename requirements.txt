@@ -13,3 +13,12 @@ requests
 pdfminer.six
 python-pptx
 python-docx
+openai>=1.40.0
+python-pptx
+python-docx
+pdfminer.six
+python-multipart
+fastapi
+uvicorn
+requests
+Pillow
