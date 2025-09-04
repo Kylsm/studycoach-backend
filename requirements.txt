@@ -1,10 +1,6 @@
 fastapi
-uvicorn[standard]
-requests
-pdfminer.six
-python-pptx
-python-docx
-fastapi
 uvicorn
 python-multipart
+pdfminer.six
+python-pptx
 pydantic
