@@ -1,87 +1,179 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-import requests, io, re, zipfile
-from pdfminer.high_level import extract_text
-from pptx import Presentation
-from docx import Document
+import requests, io, re
 from collections import Counter
 
-app = FastAPI(title="StudyCoach Backend", version="1.2")
+# --- مستخرِجات النص ---
+from pdfminer.high_level import extract_text as pdf_extract_text
+from pptx import Presentation
+from docx import Document
+
+app = FastAPI(title="StudyCoach Backend", version="2.0")
+
+# ========================
+# نماذج البيانات (لـ iOS)
+# ========================
+class SummaryBlock(BaseModel):
+    title: str
+    bullets: list[str]
+
+class MCQ(BaseModel):
+    q: str
+    choices: list[str]
+    answer: int
+    explain: str | None = None
+
+class AIResponse(BaseModel):
+    ok: bool
+    summary_blocks: list[SummaryBlock]
+    mcq: list[MCQ]
 
 class PDFRequest(BaseModel):
     url: str  # قد يكون PDF أو PPTX أو DOCX
 
+# ========================
+# أدوات مساعدة
+# ========================
 def clean_text(t: str) -> str:
-    return re.sub(r'\s+', ' ', (t or '')).strip()
+    return re.sub(r"\s+", " ", (t or "")).strip()
 
-def extract_from_pdf(data: bytes) -> str:
-    return extract_text(io.BytesIO(data)) or ""
+def extract_text_from_pdf_bytes(b: bytes) -> str:
+    with io.BytesIO(b) as bio:
+        return pdf_extract_text(bio) or ""
 
-def extract_from_pptx(data: bytes) -> str:
-    text = []
-    prs = Presentation(io.BytesIO(data))
+def extract_text_from_pptx_bytes(b: bytes) -> str:
+    prs = Presentation(io.BytesIO(b))
+    chunks = []
     for slide in prs.slides:
         for shape in slide.shapes:
             if hasattr(shape, "text") and shape.text:
-                text.append(shape.text)
-    return "\n".join(text)
+                txt = shape.text.strip()
+                if txt:
+                    chunks.append(txt)
+    return "\n".join(chunks)
 
-def extract_from_docx(data: bytes) -> str:
-    # python-docx يدعم التحميل من file-like
-    doc = Document(io.BytesIO(data))
-    text = []
+def extract_text_from_docx_bytes(b: bytes) -> str:
+    doc = Document(io.BytesIO(b))
+    chunks = []
     for p in doc.paragraphs:
-        if p.text:
-            text.append(p.text)
-    return "\n".join(text)
+        txt = (p.text or "").strip()
+        if txt:
+            chunks.append(txt)
+    return "\n".join(chunks)
 
-def naive_sentences(text: str):
-    parts = re.split(r'(?<=[.!?\u061F])\s+', text)
+def naive_sentences(text: str) -> list[str]:
+    # تقسيم بسيط مع دعم ؟ العربية
+    parts = re.split(r'(?<=[\.\!\?\u061F])\s+', text)
     return [s.strip() for s in parts if len(s.strip()) > 30]
 
-def top_terms(text: str, k=20):
+def top_terms(text: str, k=40) -> list[str]:
     words = re.findall(r"[A-Za-z\u0600-\u06FF][A-Za-z0-9_\u0600-\u06FF'-]*", text)
     words = [w.lower() for w in words if len(w) > 3]
-    stop = {"this","that","with","from","your","about","these","those","which","their",
-            "have","will","there","here","where","when","then","into","over","under",
-            "also","such","than","only","very","more","most","much","many","some",
-            "been","were","what","shall","should","could","would","might","must"}
+    stop = {
+        "this","that","with","from","your","about","these","those","which","their","have","will","there","here","where",
+        "when","then","into","over","under","also","such","than","only","very","more","most","much","many","some",
+        "been","were","what","shall","should","could","would","might","must","also","upon","into","between","within"
+    }
     common = [w for w in words if w not in stop]
     return [w for w,_ in Counter(common).most_common(k)]
 
-def summarize(text: str, max_sents=6):
+# ========================
+# توليد الملخّص + MCQ (هيوريستك محلي)
+# ========================
+def build_summary_blocks(text: str, max_blocks: int = 4, bullets_per_block: int = 4) -> list[SummaryBlock]:
     sents = naive_sentences(text)
     if not sents:
-        return "No clear sentences extracted."
-    terms = set(top_terms(text, k=25))
+        return [SummaryBlock(title="ملحوظة", bullets=["تعذّر استخراج جمل كافية من الملف."])]
+    terms = set(top_terms(text, k=30))
     scored = []
     for s in sents:
         score = sum(1 for w in re.findall(r"[A-Za-z\u0600-\u06FF][A-Za-z0-9_\u0600-\u06FF'-]*", s.lower()) if w in terms)
         scored.append((score, s))
-    pick = [sents[0]] + [s for _, s in sorted(scored, key=lambda x: x[0], reverse=True)[:max_sents-1]]
-    guidance = "\n\nReflection:\n- ما المفهوم الرئيسي؟\n- مثال يوضّحه؟\n- الفرق مع مفهوم قريب؟\n- أين نوظّفه في MIS؟"
-    return "\n".join(pick) + guidance
+    # اختَر أفضل الجمل ورتّبها على شكل مجموعات
+    top = [s for _, s in sorted(scored, key=lambda x: x[0], reverse=True)[:max_blocks * bullets_per_block]]
+    blocks = []
+    for i in range(0, len(top), bullets_per_block):
+        chunk = top[i:i+bullets_per_block]
+        if not chunk: break
+        title = f"أفكار رئيسية #{len(blocks)+1}"
+        bullets = [clean_text(s) for s in chunk]
+        blocks.append(SummaryBlock(title=title, bullets=bullets))
+        if len(blocks) >= max_blocks: break
+    return blocks
 
-def cloze_quiz(text: str, n=5):
-    terms = top_terms(text, k=40)
+def build_mcq(text: str, n: int = 6) -> list[MCQ]:
+    """
+    MCQ بسيط: نأخذ مصطلحات متكررة كإجابات صحيحة، ونولّد مشتتات من مصطلحات أخرى.
+    هذا حل محلي سريع؛ لاحقًا ممكن نستبدله باستدعاء OpenAI.
+    """
+    terms = top_terms(text, k=50)
+    if len(terms) < 6:
+        # fallback بسيط
+        return [
+            MCQ(q="سؤال تجريبي: ما هي أفضل طريقة لاستخلاص الأفكار الرئيسية؟",
+                choices=["القراءة السريعة", "التلخيص الآلي", "مراجعة الأسئلة", "كل ما سبق"],
+                answer=3,
+                explain="الدمج بين أكثر من طريقة يرفع جودة الاستيعاب.")
+        ]
+
     sents = naive_sentences(text)
-    qs, used = [], set()
-    for s in sents:
-        for t in terms:
-            if t in used: continue
-            if re.search(rf"\b{re.escape(t)}\b", s, flags=re.IGNORECASE):
-                masked = re.sub(rf"\b{re.escape(t)}\b", "____", s, flags=re.IGNORECASE, count=1)
-                qs.append({"stem": masked, "hint": f"length: {len(t)}"})
-                used.add(t)
-                break
-        if len(qs) >= n: break
-    if not qs and sents:
-        qs = [{"stem": re.sub(r"[A-Za-z0-9\u0600-\u06FF]{4,}", "____", sents[0], count=1), "hint":"fill the missing word"}]
+    qs = []
+    used = set()
+    i = 0
+    for t in terms:
+        if t in used: 
+            continue
+        # ابحث جملة تحتوي t
+        sent = next((s for s in sents if re.search(rf"\b{re.escape(t)}\b", s, re.IGNORECASE)), None)
+        if not sent:
+            continue
+        # خيارات: الصحيحة t + 3 مشتتات
+        distractors = [d for d in terms if d != t][:12]  # مجموعة أولية
+        import random
+        random.shuffle(distractors)
+        distractors = distractors[:3]
+        choices = [t] + distractors
+        random.shuffle(choices)
+        answer_idx = choices.index(t)
+        qs.append(MCQ(
+            q=f"اختر المصطلح الذي يكمّل الفكرة: «{clean_text(sent)}»",
+            choices=choices,
+            answer=answer_idx,
+            explain=f"المصطلح المناسب في السياق هو «{t}»."
+        ))
+        used.add(t)
+        i += 1
+        if i >= n:
+            break
+    if not qs:
+        # fallback لو ما لقينا مطابقات
+        qs = [MCQ(q="سؤال عام: أي مما يلي يُعد فائدة للتلخيص؟",
+                  choices=["تقليل الوقت", "فهم أعمق", "تثبيت المعلومة", "كل ما سبق"],
+                  answer=3,
+                  explain="التلخيص الجيد يجمع كل ما سبق.")]
     return qs
 
-@app.post("/process_pdf")
+def make_response_from_text(text: str) -> AIResponse:
+    text = clean_text(text)
+    if len(text) < 80:
+        raise HTTPException(status_code=422, detail="تعذّر استخراج نص كافٍ من الملف.")
+    blocks = build_summary_blocks(text)
+    mcq = build_mcq(text)
+    return AIResponse(ok=True, summary_blocks=blocks, mcq=mcq)
+
+# ========================
+# صحّة الخادم
+# ========================
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+# ========================
+# من رابط (PDF/PPTX/DOCX)
+# ========================
+@app.post("/process_pdf", response_model=AIResponse)
 def process_pdf(req: PDFRequest):
-    # نزّل الملف من مودل (fileurl + token=... يخلّيه قابل للتحميل المباشر)
     try:
         r = requests.get(req.url, timeout=40)
         r.raise_for_status()
@@ -91,19 +183,17 @@ def process_pdf(req: PDFRequest):
     content_type = (r.headers.get("Content-Type") or "").lower()
     url_lower = req.url.lower()
 
-    # حدّد النوع
-    text = ""
     try:
         if "pdf" in content_type or url_lower.endswith(".pdf"):
-            text = extract_from_pdf(r.content)
+            text = extract_text_from_pdf_bytes(r.content)
         elif "presentation" in content_type or url_lower.endswith(".pptx"):
-            text = extract_from_pptx(r.content)
+            text = extract_text_from_pptx_bytes(r.content)
         elif "word" in content_type or url_lower.endswith(".docx"):
-            text = extract_from_docx(r.content)
+            text = extract_text_from_docx_bytes(r.content)
         else:
-            # fallback: جرّب PDF أولاً
+            # جرّب PDF كـ fallback
             try:
-                text = extract_from_pdf(r.content)
+                text = extract_text_from_pdf_bytes(r.content)
             except Exception:
                 raise HTTPException(status_code=415, detail=f"Unsupported file type: {content_type or 'unknown'}")
     except HTTPException:
@@ -111,26 +201,36 @@ def process_pdf(req: PDFRequest):
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Extract error: {e}")
 
-    text = clean_text(text)
-    if len(text) < 120:
-        raise HTTPException(status_code=422, detail="Too little text extracted.")
+    return make_response_from_text(text)
 
-    return {"ok": True, "summary": summarize(text), "quiz": cloze_quiz(text)}
+# ========================
+# رفع ملف (PDF/PPTX/DOCX)
+# ========================
+@app.post("/process_pdf_upload", response_model=AIResponse)
+async def process_pdf_upload(file: UploadFile = File(...)):
+    try:
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="ملف فارغ")
 
+        name = (file.filename or "").lower()
+        if name.endswith(".pdf"):
+            text = extract_text_from_pdf_bytes(content)
+        elif name.endswith(".pptx"):
+            text = extract_text_from_pptx_bytes(content)
+        elif name.endswith(".docx"):
+            text = extract_text_from_docx_bytes(content)
+        else:
+            raise HTTPException(status_code=415, detail="النوع غير مدعوم. ارفع PDF أو PPTX أو DOCX")
+
+        return make_response_from_text(text)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": f"Server error: {e.__class__.__name__}"})
+
+# تشغيل محلي فقط
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-    # requirements.txt
-# fastapi
-# uvicorn
-# python-multipart  <-- مهم لرفع الملفات (multipart/form-data)
-
-from fastapi import UploadFile, File
-
-@app.post("/process_pdf_upload")
-async def process_pdf_upload(file: UploadFile = File(...)):
-    content = await file.read()                # bytes
-    # TODO: استخرج النص من الـPDF bytes بنفس دوالك الحالية
-    text = extract_text_from_pdf_bytes(content)  # اكتبها أو أعد استخدام منطقك
-    summary_blocks, mcq = await run_ai_pipeline(text)  # مولّد الملخص + الأسئلة
-    return {"ok": True, "summary_blocks": summary_blocks, "mcq": mcq}
