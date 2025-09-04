@@ -6,3 +6,10 @@ openai>=1.0.0    # لو بتستخدم شرح AI
 python-pptx
 python-docx
 pdfminer.six
+fastapi
+uvicorn
+python-multipart
+requests
+pdfminer.six
+python-pptx
+python-docx
