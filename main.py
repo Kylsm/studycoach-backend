@@ -120,3 +120,17 @@ def process_pdf(req: PDFRequest):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+    # requirements.txt
+# fastapi
+# uvicorn
+# python-multipart  <-- مهم لرفع الملفات (multipart/form-data)
+
+from fastapi import UploadFile, File
+
+@app.post("/process_pdf_upload")
+async def process_pdf_upload(file: UploadFile = File(...)):
+    content = await file.read()                # bytes
+    # TODO: استخرج النص من الـPDF bytes بنفس دوالك الحالية
+    text = extract_text_from_pdf_bytes(content)  # اكتبها أو أعد استخدام منطقك
+    summary_blocks, mcq = await run_ai_pipeline(text)  # مولّد الملخص + الأسئلة
+    return {"ok": True, "summary_blocks": summary_blocks, "mcq": mcq}
