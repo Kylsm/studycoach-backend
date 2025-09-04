@@ -322,3 +322,180 @@ if __name__ == "__main__":
     # للبيئة المحلية فقط؛ في Render استخدم Start Command:
     # uvicorn main:app --host 0.0.0.0 --port $PORT
     uvicorn.run(app, host="0.0.0.0", port=8000)
+    import os, base64
+from typing import List, Dict, Any
+from PIL import Image
+from io import BytesIO
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+def pptx_slides_text_and_images(pptx_bytes: bytes) -> List[Dict[str, Any]]:
+    """
+    يُرجع قائمة شرائح. كل شريحة: {"texts": [str...], "images": [bytes...]}
+    - النصوص تُستخرج من كل Shape نصّي
+    - الصور تُستخرج من الأشكال من نوع صورة (Picture) إن وُجدت
+    """
+    slides_out = []
+    prs = Presentation(io.BytesIO(pptx_bytes))
+    for slide in prs.slides:
+        texts = []
+        images = []
+        for shape in slide.shapes:
+            # نص
+            if hasattr(shape, "has_text_frame") and shape.has_text_frame:
+                t = shape.text or ""
+                t = re.sub(r"\s+", " ", t).strip()
+                if t:
+                    texts.append(t)
+            # صورة
+            try:
+                if shape.shape_type == 13:  # MSO_SHAPE_TYPE.PICTURE
+                    img = shape.image
+                    images.append(img.blob)  # bytes
+            except Exception:
+                pass
+        slides_out.append({"texts": texts, "images": images})
+    return slides_out
+
+def to_png_base64(image_bytes: bytes) -> str:
+    """
+    نحاول تحويل الصورة لأي صيغة واردة إلى PNG ثم Base64 لتسليمها لـ OpenAI Vision.
+    """
+    try:
+        im = Image.open(BytesIO(image_bytes))
+        # OPTIONAL: يمكن تصغير العرض للحفاظ على التكلفة
+        buf = BytesIO()
+        im.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception:
+        # fallback: أرسل كما هي لو كانت PNG جاهزة
+        return base64.b64encode(image_bytes).decode("utf-8")
+        from fastapi import Body
+
+class VisionReq(BaseModel):
+    url: str
+    lang: str = "ar"  # "ar" أو "en"
+    max_slides: int = 12  # للحد من التكلفة
+
+@app.post("/ai/pptx_vision", response_model=AIResponse)
+def ai_pptx_vision(req: VisionReq):
+    if not OPENAI_API_KEY:
+        raise HTTPException(400, "OpenAI key not configured")
+    # نزّل PPTX
+    try:
+        rr = requests.get(req.url, timeout=60)
+        rr.raise_for_status()
+    except Exception as e:
+        raise HTTPException(400, f"Download error: {e}")
+
+    name = req.url.lower()
+    if not name.endswith(".pptx"):
+        # نسمح فقط PPTX مبدئياً
+        raise HTTPException(415, "Only PPTX is supported by this Vision endpoint")
+
+    slides = pptx_slides_text_and_images(rr.content)
+    if not slides:
+        # لا شرائح
+        return AIResponse(ok=True,
+                          summary_blocks=[SummaryBlock(title="معلومة", bullets=["الملف لا يحتوي شرائح قابلة للقراءة."])],
+                          mcq=[])
+
+    # حضّر برسالة النظام لغتك
+    if req.lang == "ar":
+        system_msg = (
+            "أنت مُعلّم ذكي. لخص كل شريحة باقتضاب، ثم استخرج النقاط الرئيسية. "
+            "في النهاية أنشئ 6 أسئلة اختيار من متعدد تغطي أهم المفاهيم مع إجابة صحيحة لكل سؤال."
+        )
+    else:
+        system_msg = (
+            "You are a helpful tutor. For each slide, produce a concise summary and key bullet points. "
+            "At the end, create 6 multiple-choice questions covering key concepts, with the correct answer index."
+        )
+
+    # نجهّز محتوى الرسالة: لكل شريحة نرسل نصوصها + صورها (Base64)
+    # ملاحظة: سنرسل دفعة واحدة لتكون النتيجة موحدة؛ لو الملف كبير نقسمه دفعات.
+    contents: List[Dict[str, Any]] = [{"role": "system", "content": system_msg}]
+    slide_count = 0
+
+    def slide_header(i:int) -> str:
+        return f"Slide {i+1}:" if req.lang != "ar" else f"الشريحة {i+1}:"
+
+    for i, s in enumerate(slides):
+        if i >= req.max_slides:
+            break
+        part: List[Any] = []
+        # العنوان النصي
+        texts = s.get("texts") or []
+        if texts:
+            joined = " • ".join(texts)
+            part.append({"type": "text", "text": f"{slide_header(i)}\n{texts[0] if texts else ''}\nDetails: {joined}" if req.lang != "ar"
+                         else f"{slide_header(i)}\n{texts[0] if texts else ''}\nتفاصيل: {joined}"})
+        else:
+            part.append({"type": "text", "text": slide_header(i)})
+
+        # الصور
+        images = s.get("images") or []
+        for img_bytes in images[:3]:  # حد أعلى 3 صور/شريحة لتقليل التكلفة
+            b64 = to_png_base64(img_bytes)
+            part.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/png;base64,{b64}"
+                }
+            })
+        contents.append({"role": "user", "content": part})
+        slide_count += 1
+
+    # نطلب من النموذج ملخص موحّد + أسئلة
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",  # رؤية + كلفة مناسبة
+            messages=contents,
+            temperature=0.3,
+        )
+        raw = resp.choices[0].message.content or ""
+    except Exception as e:
+        raise HTTPException(500, f"OpenAI error: {e}")
+
+    # نُحوّل نص الاستجابة إلى بنية AIResponse مبسطة:
+    # - نقسم لبلوكات (حسب العناوين) heuristics
+    blocks: List[SummaryBlock] = []
+    bullets: List[str] = []
+    title = "ملخص الشرائح" if req.lang == "ar" else "Slides Summary"
+    for line in (raw.splitlines() if raw else []):
+        line = line.strip()
+        if not line: 
+            continue
+        # اعتبر سطر فيه عنوان قوي بداية بلوك
+        if re.match(r"^(Slide|الشريحة|Summary|الملخص|Key points|النقاط الرئيسية)", line, re.IGNORECASE):
+            if bullets:
+                blocks.append(SummaryBlock(title=title, bullets=bullets[:8]))
+                bullets = []
+            title = line[:80]
+        else:
+            bullets.append(line)
+    if bullets:
+        blocks.append(SummaryBlock(title=title, bullets=bullets[:8]))
+    if not blocks:
+        blocks = [SummaryBlock(title=title, bullets=[raw[:4000] if raw else ("No content" if req.lang!="ar" else "لا يوجد محتوى")])]
+
+    # توليد MCQ بسيط من نفس الناتج النصي (fallback محلي) — تقدر لاحقًا تولّد MCQ متقدّم من Vision مباشرة
+    mcq = build_mcq(raw or "", n=6)
+
+    return AIResponse(ok=True, summary_blocks=blocks[:6], mcq=mcq)
+    @app.post("/ai/pptx_vision_upload", response_model=AIResponse)
+async def ai_pptx_vision_upload(file: UploadFile = File(...), lang: str = "ar", max_slides: int = 12):
+    if not OPENAI_API_KEY:
+        raise HTTPException(400, "OpenAI key not configured")
+    content = await file.read()
+    if not (file.filename or "").lower().endswith(".pptx"):
+        raise HTTPException(415, "Only PPTX is supported here")
+    req = VisionReq(url="upload://", lang=lang, max_slides=max_slides)  # للموحّدة فقط
+    # نفس المنطق:
+    slides = pptx_slides_text_and_images(content)
+    # ... (يمكنك نسخ نفس كتلة المعالجة من ai_pptx_vision وتطبيقها هنا)
+    # للحفاظ على الإيجاز، يمكنك إعادة استخدام دالة مشتركة إن أردت.
+    raise HTTPException(501, "Not implemented here to keep the snippet short. Use /ai/pptx_vision with URL.")
+    
