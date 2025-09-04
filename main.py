@@ -1,5 +1,5 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, UploadFile, File, Query
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 import requests, io, re
 from collections import Counter
@@ -9,7 +9,7 @@ from pdfminer.high_level import extract_text as pdf_extract_text
 from pptx import Presentation
 from docx import Document
 
-app = FastAPI(title="StudyCoach Backend", version="2.0")
+app = FastAPI(title="StudyCoach Backend", version="2.1")
 
 # ========================
 # نماذج البيانات (لـ iOS)
@@ -73,7 +73,7 @@ def top_terms(text: str, k=40) -> list[str]:
     stop = {
         "this","that","with","from","your","about","these","those","which","their","have","will","there","here","where",
         "when","then","into","over","under","also","such","than","only","very","more","most","much","many","some",
-        "been","were","what","shall","should","could","would","might","must","also","upon","into","between","within"
+        "been","were","what","shall","should","could","would","might","must","also","upon","between","within"
     }
     common = [w for w in words if w not in stop]
     return [w for w,_ in Counter(common).most_common(k)]
@@ -105,7 +105,7 @@ def build_summary_blocks(text: str, max_blocks: int = 4, bullets_per_block: int 
 def build_mcq(text: str, n: int = 6) -> list[MCQ]:
     """
     MCQ بسيط: نأخذ مصطلحات متكررة كإجابات صحيحة، ونولّد مشتتات من مصطلحات أخرى.
-    هذا حل محلي سريع؛ لاحقًا ممكن نستبدله باستدعاء OpenAI.
+    هذا حل محلي سريع؛ لاحقًا ممكن نستبدله باستدعاء نموذج ذكاء اصطناعي.
     """
     terms = top_terms(text, k=50)
     if len(terms) < 6:
@@ -121,18 +121,18 @@ def build_mcq(text: str, n: int = 6) -> list[MCQ]:
     qs = []
     used = set()
     i = 0
+    import random
     for t in terms:
-        if t in used: 
+        if t in used:
             continue
         # ابحث جملة تحتوي t
         sent = next((s for s in sents if re.search(rf"\b{re.escape(t)}\b", s, re.IGNORECASE)), None)
         if not sent:
             continue
         # خيارات: الصحيحة t + 3 مشتتات
-        distractors = [d for d in terms if d != t][:12]  # مجموعة أولية
-        import random
-        random.shuffle(distractors)
-        distractors = distractors[:3]
+        distractors_pool = [d for d in terms if d != t]
+        random.shuffle(distractors_pool)
+        distractors = distractors_pool[:3] if len(distractors_pool) >= 3 else distractors_pool
         choices = [t] + distractors
         random.shuffle(choices)
         answer_idx = choices.index(t)
@@ -147,7 +147,6 @@ def build_mcq(text: str, n: int = 6) -> list[MCQ]:
         if i >= n:
             break
     if not qs:
-        # fallback لو ما لقينا مطابقات
         qs = [MCQ(q="سؤال عام: أي مما يلي يُعد فائدة للتلخيص؟",
                   choices=["تقليل الوقت", "فهم أعمق", "تثبيت المعلومة", "كل ما سبق"],
                   answer=3,
@@ -230,41 +229,53 @@ async def process_pdf_upload(file: UploadFile = File(...)):
     except Exception as e:
         return JSONResponse(status_code=500, content={"ok": False, "error": f"Server error: {e.__class__.__name__}"})
 
-# تشغيل محلي فقط
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-# =============== Moodle Proxy ===============
-from fastapi import FastAPI, HTTPException, UploadFile, File, Query
-from pydantic import BaseModel
-import requests, io
+# ========================
+# أدوات استدعاء Moodle (مساعدة داخلية)
+# ========================
+def _moodle_post(base: str, token: str, wsfunction: str, extra: dict | None = None, timeout: int = 40):
+    url = f"{base}/webservice/rest/server.php"
+    payload = {
+        "wstoken": token,
+        "moodlewsrestformat": "json",
+        "wsfunction": wsfunction,
+    }
+    if extra:
+        payload.update(extra)
+    r = requests.post(url, data=payload, timeout=timeout)
+    if r.status_code != 200:
+        raise HTTPException(502, f"Moodle HTTP {r.status_code}")
+    data = r.json()
+    if isinstance(data, dict) and data.get("exception"):
+        # رسائل خطأ Moodle القياسية
+        raise HTTPException(400, f"Moodle error: {data.get('message','unknown')}")
+    return data
 
+# ========================
+# Moodle: جلب المقررات (مع حل الهوية أولاً)
+# ========================
 class MoodCoursesReq(BaseModel):
     base: str   # مثل https://lms.yu.edu.sa
     token: str  # moodle_mobile_app token
 
 @app.post("/moodle/courses")
 def moodle_courses(req: MoodCoursesReq):
-    # core_enrol_get_users_courses (يتطلب user id عادةً؛ لكن مع توكن الموبايل نقدر نجيب أنا ذاتياً)
-    # نستخدم خدمة tool_mobile_call_external_functions عبر server.php
-    url = f"{req.base}/webservice/rest/server.php"
-    payload = {
-        "wstoken": req.token,
-        "moodlewsrestformat": "json",
-        "wsfunction": "core_enrol_get_users_courses",
-        "userid": 0  # 0 = المستخدم الحالي للتوكن في بعض تركيبات الموودل، وإن فشل نرجع رسالة
-    }
-    r = requests.post(url, data=payload, timeout=40)
-    if r.status_code != 200:
-        raise HTTPException(502, "Moodle courses fetch failed")
-    data = r.json()
-    if isinstance(data, dict) and data.get("exception"):
-        # محاولة بديلة: tool_mobile_get_course_contents مع استدعاء آخر يتطلب courseid لاحقاً
-        raise HTTPException(400, f"Moodle error: {data.get('message','unknown')}")
-    # نبسّط: id, shortname, fullname
-    out = [{"id": c.get("id"), "shortname": c.get("shortname"), "fullname": c.get("fullname")} for c in data]
+    # 1) احصل على user id عبر get_site_info
+    site = _moodle_post(req.base, req.token, "core_webservice_get_site_info")
+    userid = site.get("userid")
+    if not userid:
+        raise HTTPException(400, "Could not resolve user id from token")
+
+    # 2) احضر المقررات لهذا المستخدم
+    courses = _moodle_post(req.base, req.token, "core_enrol_get_users_courses", {"userid": userid})
+
+    out = [{"id": c.get("id"),
+            "shortname": c.get("shortname"),
+            "fullname": c.get("fullname")} for c in courses]
     return {"ok": True, "courses": out}
 
+# ========================
+# Moodle: جلب محتويات المقرر (ملفات قابلة للتنزيل)
+# ========================
 class MoodContentsReq(BaseModel):
     base: str
     token: str
@@ -272,35 +283,25 @@ class MoodContentsReq(BaseModel):
 
 @app.post("/moodle/contents")
 def moodle_course_contents(req: MoodContentsReq):
-    # core_course_get_contents لإحضار ملفات المقرر
-    url = f"{req.base}/webservice/rest/server.php"
-    payload = {
-        "wstoken": req.token,
-        "moodlewsrestformat": "json",
-        "wsfunction": "core_course_get_contents",
-        "courseid": req.courseid
-    }
-    r = requests.post(url, data=payload, timeout=40)
-    if r.status_code != 200:
-        raise HTTPException(502, "Moodle contents fetch failed")
-    data = r.json()
-    if isinstance(data, dict) and data.get("exception"):
-        raise HTTPException(400, f"Moodle error: {data.get('message','unknown')}")
+    data = _moodle_post(req.base, req.token, "core_course_get_contents", {"courseid": req.courseid})
     # نستخرج الملفات القابلة للتنزيل (resource, fileurl)
     files = []
     for section in data:
-        for mod in section.get("modules", []):
+        for mod in section.get("modules", []) or []:
             for f in mod.get("contents", []) or []:
                 fileurl = f.get("fileurl")
                 if fileurl:
                     files.append({
                         "name": f.get("filename") or f.get("filepath") or mod.get("name"),
-                        "fileurl": fileurl,  # سنستخدمه عبر بروكسي التحميل أدناه
+                        "fileurl": fileurl,  # سيُستخدم عبر بروكسي التحميل أدناه
                         "modname": mod.get("modname"),
                         "section": section.get("name") or ""
                     })
     return {"ok": True, "files": files}
 
+# ========================
+# Moodle: بروكسي تنزيل الملف (يمرر الـtoken) + Content-Type
+# ========================
 @app.get("/moodle/fetch")
 def moodle_fetch(fileurl: str = Query(...), token: str = Query(...)):
     # تنزيل الملف من Moodle باستخدام توكن (fileurl+token=...)
@@ -310,5 +311,14 @@ def moodle_fetch(fileurl: str = Query(...), token: str = Query(...)):
     rr = requests.get(fileurl, timeout=60)
     if rr.status_code != 200:
         raise HTTPException(400, "Failed to fetch file from Moodle")
-    # نعيد البايتات كما هي (سيستقبلها الـiOS عبر endpoint آخر أو نستعملها داخليًا)
-    return rr.content
+    ctype = rr.headers.get("Content-Type", "application/octet-stream")
+    return Response(content=rr.content, media_type=ctype)
+
+# ========================
+# تشغيل محلي فقط
+# ========================
+if __name__ == "__main__":
+    import uvicorn
+    # للبيئة المحلية فقط؛ في Render استخدم Start Command:
+    # uvicorn main:app --host 0.0.0.0 --port $PORT
+    uvicorn.run(app, host="0.0.0.0", port=8000)
