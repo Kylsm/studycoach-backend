@@ -2,3 +2,5 @@ fastapi
 uvicorn[standard]
 requests
 pdfminer.six
+python-pptx
+python-docx
