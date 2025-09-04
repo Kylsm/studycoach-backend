@@ -1,8 +1,8 @@
 fastapi
 uvicorn
+python-multipart
 requests
-pdfminer.six
+openai>=1.0.0    # لو بتستخدم شرح AI
 python-pptx
 python-docx
-python-multipart
-pydantic
+pdfminer.six
