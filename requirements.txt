@@ -4,3 +4,7 @@ requests
 pdfminer.six
 python-pptx
 python-docx
+fastapi
+uvicorn
+python-multipart
+pydantic
